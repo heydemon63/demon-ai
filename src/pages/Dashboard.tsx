@@ -65,7 +65,7 @@ const Dashboard = () => {
               <Bot className="w-6 h-6 text-white" />
             </div>
             <div>
-              <h1 className="text-xl font-bold">Personal AI</h1>
+              <h1 className="text-xl font-bold">DEMON AI</h1>
               <p className="text-sm text-muted-foreground">
                 Welcome, {user?.email?.split("@")[0]}
               </p>
