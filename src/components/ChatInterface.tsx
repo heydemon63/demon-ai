@@ -20,38 +20,77 @@ export const ChatInterface = () => {
   const [imagePrompt, setImagePrompt] = useState("");
   const [generatingImage, setGeneratingImage] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const speechSynthesis = window.speechSynthesis;
+  const lastInteractionRef = useRef<number>(Date.now());
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const speakText = (text: string) => {
+  // Continuous conversation - auto-initiate after 15 seconds of silence
+  useEffect(() => {
+    const checkSilence = () => {
+      const timeSinceLastInteraction = Date.now() - lastInteractionRef.current;
+      
+      if (timeSinceLastInteraction > 15000 && !loading && messages.length > 0) {
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage.role === "user") {
+          initiateConversation();
+        }
+      }
+    };
+
+    const interval = setInterval(checkSilence, 5000);
+    return () => clearInterval(interval);
+  }, [messages, loading]);
+
+  const initiateConversation = async () => {
+    const starters = [
+      "Hey, are you still there?",
+      "Should I tell you something interesting?",
+      "Want to continue our chat?",
+      "I'm still here if you want to talk!",
+      "What's on your mind?"
+    ];
+    
+    const randomStarter = starters[Math.floor(Math.random() * starters.length)];
+    
+    const systemMessage = `The user has been silent. Start the conversation with: "${randomStarter}" and then say something relevant or interesting.`;
+    
+    await sendMessageInternal(systemMessage, true);
+  };
+
+  const speakText = async (text: string) => {
     if (speaking) {
-      speechSynthesis.cancel();
       setSpeaking(false);
       return;
     }
 
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 0.9;
-    utterance.pitch = 1;
-    utterance.volume = 1;
-    
-    const voices = speechSynthesis.getVoices();
-    const preferredVoice = voices.find(voice => 
-      voice.lang.startsWith('en') && voice.name.includes('Natural')
-    ) || voices.find(voice => voice.lang.startsWith('en'));
-    
-    if (preferredVoice) {
-      utterance.voice = preferredVoice;
+    try {
+      setSpeaking(true);
+      const { data, error } = await supabase.functions.invoke('text-to-speech', {
+        body: { text, voice: '9BWtsMINqrJLrRacOk9x' }
+      });
+
+      if (error) throw error;
+
+      if (data?.audioContent) {
+        const audio = new Audio(`data:audio/mp3;base64,${data.audioContent}`);
+        audio.onended = () => setSpeaking(false);
+        await audio.play();
+      }
+    } catch (error) {
+      console.error("TTS Error:", error);
+      setSpeaking(false);
+      
+      // Fallback to Web Speech API
+      if ('speechSynthesis' in window) {
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.rate = 0.9;
+        utterance.pitch = 1;
+        utterance.onend = () => setSpeaking(false);
+        window.speechSynthesis.speak(utterance);
+      }
     }
-
-    utterance.onstart = () => setSpeaking(true);
-    utterance.onend = () => setSpeaking(false);
-    utterance.onerror = () => setSpeaking(false);
-
-    speechSynthesis.speak(utterance);
   };
 
   const generateImage = async () => {
@@ -98,10 +137,11 @@ export const ChatInterface = () => {
 
   const sendMessage = async () => {
     if (!input.trim() || loading) return;
+    lastInteractionRef.current = Date.now();
+    await sendMessageInternal(input, false);
+  };
 
-    const userMessage: Message = { role: "user", content: input };
-    setMessages((prev) => [...prev, userMessage]);
-    setInput("");
+  const sendMessageInternal = async (content: string, isAutoInitiated: boolean) => {
     setLoading(true);
 
     try {
@@ -113,7 +153,18 @@ export const ChatInterface = () => {
         return;
       }
 
+      let userMessage: Message | null = null;
+      if (!isAutoInitiated) {
+        userMessage = { role: "user", content };
+        setMessages((prev) => [...prev, userMessage!]);
+        setInput("");
+      }
+
       const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
+
+      const messagesToSend = isAutoInitiated 
+        ? [...messages, { role: "system", content }]
+        : [...messages, { role: "user", content }];
 
       const response = await fetch(CHAT_URL, {
         method: "POST",
@@ -122,7 +173,7 @@ export const ChatInterface = () => {
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
-          messages: [...messages, userMessage].map((m) => ({
+          messages: messagesToSend.map((m) => ({
             role: m.role,
             content: m.content,
           })),
@@ -130,45 +181,41 @@ export const ChatInterface = () => {
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || "Failed to get response");
+        const errorText = await response.text();
+        console.error("Chat API error:", errorText);
+        throw new Error("Failed to get response from AI");
       }
 
-      const reader = response.body?.getReader();
+      if (!response.body) {
+        throw new Error("No response body");
+      }
+
+      const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let assistantMessage = "";
-      let streamDone = false;
-      let textBuffer = "";
 
-      // Add assistant message placeholder
-      setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "" },
+      ]);
 
-      while (!streamDone && reader) {
+      while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        textBuffer += decoder.decode(value, { stream: true });
+        const chunk = decoder.decode(value);
+        const lines = chunk.split("\n");
 
-        let newlineIndex: number;
-        while ((newlineIndex = textBuffer.indexOf("\n")) !== -1) {
-          let line = textBuffer.slice(0, newlineIndex);
-          textBuffer = textBuffer.slice(newlineIndex + 1);
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.slice(6);
+            if (data === "[DONE]") continue;
 
-          if (line.endsWith("\r")) line = line.slice(0, -1);
-          if (line.startsWith(":") || line.trim() === "") continue;
-          if (!line.startsWith("data: ")) continue;
-
-          const jsonStr = line.slice(6).trim();
-          if (jsonStr === "[DONE]") {
-            streamDone = true;
-            break;
-          }
-
-          try {
-            const parsed = JSON.parse(jsonStr);
-            const content = parsed.choices?.[0]?.delta?.content as string | undefined;
-            if (content) {
+            try {
+              const parsed = JSON.parse(data);
+              const content = parsed.choices[0]?.delta?.content || "";
               assistantMessage += content;
+
               setMessages((prev) => {
                 const newMessages = [...prev];
                 newMessages[newMessages.length - 1] = {
@@ -177,123 +224,129 @@ export const ChatInterface = () => {
                 };
                 return newMessages;
               });
+            } catch (e) {
+              console.error("Error parsing streaming data:", e);
             }
-          } catch {
-            textBuffer = line + "\n" + textBuffer;
-            break;
           }
         }
       }
 
-      // Save messages to database
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        await supabase.from("chat_messages").insert([
-          { user_id: user.id, role: "user", content: userMessage.content },
-          { user_id: user.id, role: "assistant", content: assistantMessage },
-        ]);
+      if (userMessage) {
+        await supabase.from("chat_messages").insert({
+          content: userMessage.content,
+          role: "user",
+          user_id: (await supabase.auth.getUser()).data.user?.id,
+        });
       }
+
+      await supabase.from("chat_messages").insert({
+        content: assistantMessage,
+        role: "assistant",
+        user_id: (await supabase.auth.getUser()).data.user?.id,
+      });
+
+      lastInteractionRef.current = Date.now();
+      speakText(assistantMessage);
     } catch (error: any) {
-      console.error("Chat error:", error);
+      console.error("Error sending message:", error);
       toast.error(error.message || "Failed to send message");
-      setMessages((prev) => prev.slice(0, -1));
     } finally {
       setLoading(false);
     }
   };
 
-  return (
-    <div className="flex flex-col h-full">
-      <ScrollArea className="flex-1 p-6">
-        <div className="space-y-6 max-w-3xl mx-auto">
-          {messages.length === 0 && (
-            <div className="text-center py-12 space-y-4">
-              <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-gradient-primary shadow-glow">
-                <Bot className="w-8 h-8 text-white" />
-              </div>
-              <h2 className="text-2xl font-bold">How can I assist you today?</h2>
-              <p className="text-muted-foreground">
-                I'm your personal AI assistant. Ask me anything!
-              </p>
-            </div>
+  const renderMessageContent = (content: string) => {
+    const imageMatch = content.match(/!\[.*?\]\((.*?)\)/);
+    if (imageMatch) {
+      return (
+        <div className="space-y-2">
+          <img
+            src={imageMatch[1]}
+            alt="Generated"
+            className="rounded-lg max-w-full h-auto"
+          />
+          {content.replace(/!\[.*?\]\(.*?\)/, "").trim() && (
+            <p className="text-sm">{content.replace(/!\[.*?\]\(.*?\)/, "").trim()}</p>
           )}
+        </div>
+      );
+    }
+    return <p className="whitespace-pre-wrap">{content}</p>;
+  };
 
-          {messages.map((message, i) => (
+  return (
+    <div className="flex flex-col h-[calc(100vh-12rem)]">
+      <ScrollArea className="flex-1 p-4">
+        <div className="space-y-4 max-w-4xl mx-auto">
+          {messages.map((message, index) => (
             <div
-              key={i}
-              className={`flex gap-4 ${
+              key={index}
+              className={`flex gap-3 ${
                 message.role === "user" ? "justify-end" : "justify-start"
               }`}
             >
               {message.role === "assistant" && (
-                <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gradient-primary flex items-center justify-center shadow-glow">
+                <div className="w-8 h-8 rounded-full bg-gradient-primary flex items-center justify-center flex-shrink-0">
                   <Bot className="w-5 h-5 text-white" />
                 </div>
               )}
-              <div className="flex flex-col gap-2 max-w-[80%]">
-                <div
-                  className={`rounded-2xl px-4 py-3 ${
-                    message.role === "user"
-                      ? "bg-gradient-primary text-white shadow-glow"
-                      : "bg-card border border-border"
-                  }`}
-                >
-                  {message.content.includes('![Generated Image]') ? (
-                    <div className="space-y-2">
-                      <p className="mb-2">Here's the generated image:</p>
-                      <img 
-                        src={message.content.match(/\(([^)]+)\)/)?.[1]} 
-                        alt="Generated" 
-                        className="rounded-lg max-w-full h-auto"
-                      />
-                    </div>
-                  ) : (
-                    <p className="whitespace-pre-wrap">{message.content}</p>
-                  )}
-                </div>
-                {message.role === "assistant" && !message.content.includes('![Generated Image]') && (
+              <div
+                className={`rounded-lg p-4 max-w-[80%] ${
+                  message.role === "user"
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted"
+                }`}
+              >
+                {renderMessageContent(message.content)}
+                {message.role === "assistant" && (
                   <Button
                     variant="ghost"
                     size="sm"
+                    className="mt-2"
                     onClick={() => speakText(message.content)}
-                    className="self-start gap-2"
+                    disabled={speaking}
                   >
-                    <Volume2 className={`w-4 h-4 ${speaking ? 'text-primary' : ''}`} />
-                    {speaking ? 'Stop' : 'Listen'}
+                    <Volume2 className="w-4 h-4 mr-2" />
+                    {speaking ? "Stop" : "Listen"}
                   </Button>
                 )}
               </div>
               {message.role === "user" && (
-                <div className="flex-shrink-0 w-8 h-8 rounded-full bg-secondary flex items-center justify-center">
+                <div className="w-8 h-8 rounded-full bg-secondary flex items-center justify-center flex-shrink-0">
                   <User className="w-5 h-5" />
                 </div>
               )}
             </div>
           ))}
+          {loading && (
+            <div className="flex gap-3 justify-start">
+              <div className="w-8 h-8 rounded-full bg-gradient-primary flex items-center justify-center flex-shrink-0">
+                <Bot className="w-5 h-5 text-white" />
+              </div>
+              <div className="rounded-lg p-4 bg-muted">
+                <Loader2 className="w-5 h-5 animate-spin" />
+              </div>
+            </div>
+          )}
           <div ref={scrollRef} />
         </div>
       </ScrollArea>
 
-      <div className="border-t border-border p-4 bg-card/50 backdrop-blur-sm space-y-3">
-        <div className="max-w-3xl mx-auto">
-          <div className="flex gap-2 mb-2">
+      <div className="border-t border-border p-4 bg-card/50 backdrop-blur-sm">
+        <div className="max-w-4xl mx-auto space-y-3">
+          <div className="flex gap-2">
             <Input
               value={imagePrompt}
               onChange={(e) => setImagePrompt(e.target.value)}
               placeholder="Describe an image to generate..."
+              onKeyPress={(e) => e.key === "Enter" && generateImage()}
               disabled={generatingImage}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  generateImage();
-                }
-              }}
+              className="flex-1"
             />
             <Button
               onClick={generateImage}
-              disabled={generatingImage || !imagePrompt.trim()}
+              disabled={generatingImage}
               size="icon"
-              className="shrink-0"
             >
               {generatingImage ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
@@ -302,29 +355,28 @@ export const ChatInterface = () => {
               )}
             </Button>
           </div>
-          
+
           <div className="flex gap-2">
             <Textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              placeholder="Type your message..."
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
                   sendMessage();
                 }
               }}
-              placeholder="Type your message..."
-              className="resize-none"
-              rows={2}
               disabled={loading}
+              className="min-h-[60px] resize-none"
             />
             <Button
               onClick={sendMessage}
               disabled={loading || !input.trim()}
               size="icon"
-              className="bg-gradient-primary hover:opacity-90 transition-smooth h-auto"
+              className="h-[60px]"
             >
-              <Send className="w-5 h-5" />
+              <Send className="w-4 h-4" />
             </Button>
           </div>
         </div>
